@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+audio/
+audio_new/
+audio_old/
+media/
+dist/
+build/课程工厂/
+*.mp4
+*.mp3
+*.wav
+*.safetensors
+课程工厂_配置.json
+声线参考/
