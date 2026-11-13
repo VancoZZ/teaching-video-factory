@@ -62,18 +62,30 @@ def clean_env():
 
 # ================= 文本提取 =================
 
-def extract_text(path: Path) -> str:
+PDF_MAX_PAGES = 800          # 超过则截断（书太大时防止卡死）
+TEXT_MAX_CHARS = 300_000     # 提取文本上限（约 30 万字）
+
+
+def extract_text(path: Path, progress=None) -> str:
+    """提取文本。progress(页码, 总页数) 用于大文件进度回报。"""
     ext = path.suffix.lower()
     if ext in (".txt", ".md"):
-        return path.read_text(encoding="utf-8", errors="ignore")
+        t = path.read_text(encoding="utf-8", errors="ignore")
+        return t[:TEXT_MAX_CHARS]
     if ext == ".pdf":
         from pypdf import PdfReader
         reader = PdfReader(str(path))
+        total = len(reader.pages)
         pages = []
         for i, pg in enumerate(reader.pages):
+            if progress:
+                progress(i + 1, total)
             t = (pg.extract_text() or "").strip()
             if t:
                 pages.append(t)
+            if len(pages) and sum(len(x) for x in pages) > TEXT_MAX_CHARS:
+                pages.append(f"【提示】文件过大，已截取前 {i + 1} 页")
+                break
         return "\n\n".join(pages)
     if ext == ".docx":
         import docx
@@ -84,7 +96,10 @@ def extract_text(path: Path) -> str:
                 cells = [c.text.strip() for c in row.cells if c.text.strip()]
                 if cells:
                     parts.append(" ｜ ".join(cells))
-        return "\n\n".join(parts)
+        t = "\n\n".join(parts)
+        if len(t) > TEXT_MAX_CHARS:
+            t = t[:TEXT_MAX_CHARS] + "【提示】文件过大，已截取前 30 万字"
+        return t
     if ext in (".png", ".jpg", ".jpeg", ".bmp", ".webp"):
         return ""  # 图片无法本地 OCR；提示用户配 AI 或另附文字
     raise ValueError(f"暂不支持的文件类型：{ext}")
@@ -514,10 +529,19 @@ def gui_main(cfg):
              "busy": False}
 
     def log(msg):
-        logbox.configure(state="normal")
-        logbox.insert("end", f"[{time.strftime('%H:%M:%S')}] {msg}\n")
-        logbox.see("end")
-        logbox.configure(state="disabled")
+        def _do():
+            logbox.configure(state="normal")
+            logbox.insert("end", f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+            logbox.see("end")
+            logbox.configure(state="disabled")
+        try:
+            root.after(0, _do)          # 工作线程里调用也安全
+        except RuntimeError:
+            pass
+
+    def ui(fn):
+        """把 UI 操作调度回主线程（工作线程安全）。"""
+        root.after(0, fn)
 
     def refresh_status():
         tool = Path(cfg["tool_root"])
@@ -592,8 +616,16 @@ def gui_main(cfg):
                 title = state["files"][0].stem
                 texts = []
                 for p in text_files:
-                    t = extract_text(p)
-                    log(f"已读取：{p.name}（{len(t)} 字）" if t else f"警告：{p.name} 未能提取文字")
+                    def prog(cur, total, _p=p):
+                        if cur % 50 == 0 or cur == total:
+                            log(f"正在读取 {_p.name}：第 {cur}/{total} 页…")
+                    try:
+                        t = extract_text(p, prog)
+                    except Exception as e:
+                        log(f"读取失败：{p.name}（{e}）")
+                        continue
+                    log(f"已读取：{p.name}（{len(t)} 字）" if t
+                        else f"警告：{p.name} 提不出文字（可能是扫描版/加密 PDF）")
                     if t:
                         texts.append(t)
                 full = "\n\n".join(texts).strip()
@@ -616,25 +648,31 @@ def gui_main(cfg):
                         scenes = gen_scenes_local(title, full)
                         src = "本地模板"
                 else:
-                    raise RuntimeError("没有提取到任何内容，请检查上传的文件。")
+                    raise RuntimeError(
+                        "没有提取到任何内容：可能全部是扫描版/图片型 PDF（整本书是图片）。\n"
+                        "解决办法：① 在「设置」里配 AI Key 走 AI 读图；"
+                        "② 或把书换成可复制文字的 PDF/Word 再拖入。")
                 state["scenes"] = scenes
                 state["title"] = title
-                draft.delete("1.0", "end")
-                for i, s in enumerate(scenes, 1):
-                    draft.insert("end", f"◆ 第{i}幕【{s['name']}｜{s['kind']}】\n")
-                    for ln in s.get("lines", []):
-                        draft.insert("end", f"   · {ln}\n")
-                    if s.get("main"):
-                        draft.insert("end", f"   ★ {s['main']} {s.get('sub','')}\n")
-                    if s.get("result"):
-                        draft.insert("end", f"   ⇒ {s['result']}\n")
-                    draft.insert("end", f"   〔读白〕{s['narr']}\n\n")
+
+                def fill_draft():
+                    draft.delete("1.0", "end")
+                    for i, s in enumerate(scenes, 1):
+                        draft.insert("end", f"◆ 第{i}幕【{s['name']}｜{s['kind']}】\n")
+                        for ln in s.get("lines", []):
+                            draft.insert("end", f"   · {ln}\n")
+                        if s.get("main"):
+                            draft.insert("end", f"   ★ {s['main']} {s.get('sub','')}\n")
+                        if s.get("result"):
+                            draft.insert("end", f"   ⇒ {s['result']}\n")
+                        draft.insert("end", f"   〔读白〕{s['narr']}\n\n")
+                    draftbox.set(f"稿件已生成：{len(scenes)} 幕（{src}）。确认内容后点「③ 生成视频」。")
+                ui(fill_draft)
                 log(f"稿件生成完成（{len(scenes)} 幕，来源：{src}）。可直接在上方文本框修改文字，"
-                    f"或用「按需求调整稿件」。")
-                draftbox.set(f"稿件已生成：{len(scenes)} 幕（{src}）。确认内容后点「③ 生成视频」。")
+                    f"或在底部任务框输入调整需求。")
             except Exception as e:
-                messagebox.showerror("生成稿件失败", str(e))
                 log(f"错误：{e}")
+                ui(lambda e=e: messagebox.showerror("生成稿件失败", str(e)))
             finally:
                 state["busy"] = False
         threading.Thread(target=work, daemon=True).start()
@@ -673,7 +711,7 @@ def gui_main(cfg):
                 messagebox.showwarning("未应用", f"解析到 {len(new_scenes)} 幕，与原稿 {len(state['scenes'])} 幕不一致，"
                                                  "请勿增删『◆ 第N幕』行，只改行内文字。")
         except Exception as e:
-            messagebox.showerror("应用失败", str(e))
+            ui(lambda e=e: messagebox.showerror("应用失败", str(e)))
 
     def do_feedback_draft():
         """对话框：输入需求调整稿件。"""
@@ -702,7 +740,7 @@ def gui_main(cfg):
                         log("稿件已按需求调整（AI）。")
                         win.destroy()
                     except Exception as e:
-                        messagebox.showerror("调整失败", str(e))
+                        ui(lambda e=e: messagebox.showerror("调整失败", str(e)))
                 threading.Thread(target=work, daemon=True).start()
             else:
                 new, msg = revise_scenes_local(state["scenes"], fb)
@@ -735,10 +773,10 @@ def gui_main(cfg):
                 video = run_pipeline(cfg, proj, log)
                 state["video"] = video
                 draftbox.set(f"视频已完成：{video}")
-                messagebox.showinfo("完成", f"视频已生成：\n{video}")
+                ui(lambda: messagebox.showinfo("完成", f"视频已生成：\n{video}"))
             except Exception as e:
                 log(f"错误：{e}")
-                messagebox.showerror("生成视频失败", str(e))
+                ui(lambda e=e: messagebox.showerror("生成视频失败", str(e)))
             finally:
                 state["busy"] = False
                 btnv.configure(state="normal")
@@ -789,13 +827,197 @@ def gui_main(cfg):
                 messagebox.showinfo("完成", f"新视频已生成：\n{video}")
                 win.destroy()
             except Exception as e:
-                messagebox.showerror("失败", str(e))
+                ui(lambda e=e: messagebox.showerror("失败", str(e)))
         ttk.Button(win, text="重新配音并渲染", command=rerender).pack(pady=6)
 
     btnv = ttk.Button(vrow, text="③ 生成视频", command=do_video)
     btnv.pack(side="left")
     ttk.Button(vrow, text="调整视频…", command=do_video_feedback).pack(side="left", padx=6)
     ttk.Button(vrow, text="打开输出文件夹", command=lambda: os.startfile(cfg["output_root"])).pack(side="left")
+
+    # ---- 通用任务对话框 ----
+    def render_draft_view():
+        scenes = state.get("scenes")
+        if scenes is None:
+            return
+        draft.delete("1.0", "end")
+        for i, s in enumerate(scenes, 1):
+            draft.insert("end", f"◆ 第{i}幕【{s['name']}｜{s['kind']}】\n")
+            for ln in s.get("lines", []):
+                draft.insert("end", f"   · {ln}\n")
+            if s.get("main"):
+                draft.insert("end", f"   ★ {s['main']} {s.get('sub','')}\n")
+            if s.get("result"):
+                draft.insert("end", f"   ⇒ {s['result']}\n")
+            draft.insert("end", f"   〔读白〕{s['narr']}\n\n")
+
+    TASK_HELP = ("本地指令（免 Key，输入即执行）：\n"
+                 "・语速改到0.8        ・删除第3幕\n"
+                 "・在第2幕后加一页总结：把加法法则再练一遍\n"
+                 "・修改第2幕读白为：……\n"
+                 "・画质 m（l/m/h）    ・重新配音    ・重新渲染\n"
+                 "・打开输出文件夹    ・帮助\n"
+                 "其他任何需求：配置 AI Key 后由 AI 理解并执行。")
+
+    def insert_summary(n, content):
+        scenes = state["scenes"]
+        n = min(max(n, 1), len(scenes) + 1)
+        scenes.insert(n, {"name": "补充要点", "kind": "summary",
+                          "lines": [x.strip() for x in re.split(r"[;；]", content) if x.strip()] or ["要点回顾"],
+                          "hw": "完成配套练习",
+                          "narr": f"我们把{content}再梳理一遍，请对照屏幕自查掌握情况。"})
+        return n
+
+    def _act_to_task(act):
+        op = act.get("op", "")
+        v = act.get("value", act.get("n", ""))
+        if op == "set_speed":
+            return f"语速改到{v}"
+        if op == "set_quality":
+            return f"画质{v}"
+        if op == "delete_scene":
+            return f"删除第{v}幕"
+        if op == "insert_summary":
+            return f"在第{v}幕后加一页总结：{act.get('content', '要点回顾')}"
+        if op == "edit_narr":
+            return f"修改第{v}幕读白为：{act.get('text', '')}"
+        if op == "regenerate_audio":
+            return "重新配音"
+        return act.get("text") or ""
+
+    def execute_task(task):
+        """解析并执行任务，返回回复列表（调用者线程执行，UI 走 ui()）。"""
+        replies = []
+        scenes = state.get("scenes")
+        m = re.search(r"语速\s*(?:改到|到|设为|=|：)?\s*(0\.\d+|1(?:\.0+)?)", task)
+        if m:
+            v = max(0.6, min(1.3, float(m.group(1))))
+            cfg["tts_speed"] = v
+            save_cfg(cfg)
+            replies.append(f"语速已改为 {v}（对之后的「重新配音」生效）")
+        m = re.search(r"删除第(\d+)幕", task)
+        if m and scenes:
+            n = int(m.group(1))
+            if 1 <= n <= len(scenes):
+                removed = scenes.pop(n - 1)
+                ui(render_draft_view)
+                replies.append(f"已删除第 {n} 幕（{removed['name']}）")
+        m = re.search(r"在第(\d+)幕(?:后|后面|之后)(?:加|插入)(?:一页)?(?:总结|要点|内容)?[:：]?(.*)", task)
+        if m and scenes:
+            content = m.group(2).strip() or "本次课程要点回顾"
+            n = insert_summary(int(m.group(1)), content)
+            ui(render_draft_view)
+            replies.append(f"已在第 {n} 幕后插入总结页（{content}）")
+        m = re.search(r"修改第(\d+)幕(?:的)?读白为[:：]?(.+)", task)
+        if m and scenes:
+            n = int(m.group(1))
+            if 1 <= n <= len(scenes):
+                state["scenes"][n - 1]["narr"] = m.group(2).strip()
+                ui(render_draft_view)
+                replies.append(f"已修改第 {n} 幕读白（记得「重新配音」生效）")
+        m = re.search(r"画质\s*(?:改到|到|设为|=|：)?\s*([lmhLMH])\b", task)
+        if m:
+            cfg["quality"] = m.group(1).lower()
+            save_cfg(cfg)
+            replies.append(f"画质已改为 {cfg['quality']}")
+        if re.search(r"重新配音|重配", task):
+            if state.get("scenes"):
+                replies.append("开始重新配音并渲染（完成后弹窗提示）…")
+
+                def _regen():
+                    try:
+                        proj = build_project(cfg, state["title"], state["scenes"])
+                        state["proj"] = proj
+                        video = run_pipeline(cfg, proj, log)
+                        state["video"] = video
+                        ui(lambda: messagebox.showinfo("完成", f"新视频已生成：\n{video}"))
+                    except Exception as e:
+                        ui(lambda e=e: messagebox.showerror("重新配音失败", str(e)))
+                threading.Thread(target=_regen, daemon=True).start()
+            else:
+                replies.append("还没有稿件：先点「① 生成文字稿件」")
+        elif re.search(r"重新渲染", task):
+            if state.get("proj"):
+                replies.append("开始重新渲染…")
+
+                def _rerender():
+                    try:
+                        video = run_pipeline(cfg, state["proj"], log)
+                        state["video"] = video
+                        ui(lambda: messagebox.showinfo("完成", f"新视频已生成：\n{video}"))
+                    except Exception as e:
+                        ui(lambda e=e: messagebox.showerror("重渲染失败", str(e)))
+                threading.Thread(target=_rerender, daemon=True).start()
+            else:
+                replies.append("还没有工程：先「③ 生成视频」")
+        if re.search(r"打开(输出)?文件夹", task):
+            os.startfile(cfg["output_root"])
+            replies.append("已打开输出文件夹")
+        if re.search(r"帮助|指令列表|能做什么", task):
+            replies.append(TASK_HELP)
+        if not replies:
+            if cfg.get("ai_key"):
+                replies.append("AI 正在理解任务…")
+
+                def _ai():
+                    try:
+                        scenes = state.get("scenes")
+                        ctx = {"有稿件": scenes is not None,
+                               "幕数": len(scenes) if scenes else 0,
+                               "语速": cfg["tts_speed"], "画质": cfg["quality"],
+                               "有已生成视频": state.get("video") is not None}
+                        out = call_ai(cfg, [
+                            {"role": "system", "content":
+                             "你是视频生产助手。用户给出任务，你返回 JSON："
+                             '{"reply":"给用户的说明","actions":[{"op":"...","value":...}]}。'
+                             "可用 op：set_speed(0.6-1.3)、set_quality(l/m/h)、delete_scene(n)、"
+                             "insert_summary(n,content)、edit_narr(n,text)、"
+                             "regenerate_audio(重新配音并渲染)。"
+                             "纯解释/咨询类任务把内容放 reply，actions 给空数组。"},
+                            {"role": "user",
+                             "content": f"当前状态：{json.dumps(ctx, ensure_ascii=False)}\n任务：{task}"}])
+                        m = re.search(r"\{.*\}", out, re.S)
+                        plan = json.loads(m.group(0))
+                        for act in plan.get("actions", []):
+                            replies.extend(execute_task(_act_to_task(act)))
+                        if plan.get("reply"):
+                            replies.insert(0, "AI：" + plan["reply"])
+                        log("\n".join("  " + r for r in replies))
+                    except Exception as e:
+                        replies.append(f"AI 执行失败：{e}（可改用本地指令）")
+                threading.Thread(target=_ai, daemon=True).start()
+            else:
+                replies.append("没有匹配的本地指令。\n" + TASK_HELP)
+        return replies
+
+    # ---- 任务框 UI ----
+    ttk.Label(tab1, text="任务对话框：一句话告诉我要执行的任务 / 要修改的地方（输入后回车或点「执行任务」）：").pack(anchor="w")
+    trow = ttk.Frame(tab1)
+    trow.pack(fill="x")
+    task_var = tk.StringVar()
+    task_entry = ttk.Entry(trow, textvariable=task_var)
+    task_entry.pack(side="left", fill="x", expand=True)
+
+    def run_task():
+        task = task_var.get().strip()
+        if not task or state.get("task_busy"):
+            return
+        state["task_busy"] = True
+        log(f"任务：{task}")
+
+        def work():
+            try:
+                replies = execute_task(task)
+                for r in replies:
+                    log("  " + r)
+            except Exception as e:
+                log(f"任务失败：{e}")
+                ui(lambda e=e: messagebox.showerror("任务失败", str(e)))
+            finally:
+                state["task_busy"] = False
+        threading.Thread(target=work, daemon=True).start()
+    ttk.Button(trow, text="执行任务", command=run_task).pack(side="left", padx=4)
+    task_entry.bind("<Return>", lambda e: run_task())
 
     # 日志
     ttk.Label(tab1, text="运行日志：").pack(anchor="w")
@@ -853,7 +1075,7 @@ def gui_main(cfg):
             out = call_ai(cfg_tmp, [{"role": "user", "content": "回复：连接成功"}], timeout=30)
             messagebox.showinfo("成功", f"AI 返回：{out[:80]}")
         except Exception as e:
-            messagebox.showerror("失败", str(e))
+            ui(lambda e=e: messagebox.showerror("失败", str(e)))
     ttk.Button(tab2, text="测试 AI 连接", command=test_ai).pack(anchor="w")
 
     stat.set(stat.get() + f"   配置文件：{CFG_PATH}")
