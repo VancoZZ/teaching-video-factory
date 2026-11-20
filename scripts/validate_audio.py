@@ -136,7 +136,7 @@ def fill_table(md_text, entries):
         dur = lookup.get(hit)
         if dur is None:
             for s, f, d in entries:
-                if s in f or f.split("_")[1:2] == hit.split("_")[1:2]:
+                if str(s) in str(f) or str(f).split("_")[1:2] == hit.split("_")[1:2]:
                     dur = d
                     break
         if dur is None:
