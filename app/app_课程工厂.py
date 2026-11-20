@@ -31,7 +31,8 @@ DEFAULT_CFG = {
     "tool_root": r"D:\视频生成\教学视频工具包",
     "lessonlib": "",            # 留空 = EXE 同目录的 lessonlib.py
     "output_root": r"D:\视频生成\AI生成",
-    "ref_wav": r"D:\视频生成\教学视频工具包\声线参考\clean_24k.wav",
+    "ref_wav": "",              # 声纹文件：留空=机器音色；配置后自动声线克隆
+    "tts_voice": "xiaoxiao",    # 机器音色嗓音（edge-tts）：xiaoxiao/yunyang/yunxi…
     "tts_speed": 0.85,
     "quality": "m",
     "ai_base": "https://api.deepseek.com/v1",
@@ -637,7 +638,6 @@ def run_pipeline(cfg, proj: Path, log):
     tts_py = tool / ".venv-tts/Scripts/python.exe"
     ven_py = tool / ".venv/Scripts/python.exe"
     tools = tool / "工具脚本"
-    ref = cfg["ref_wav"]
     scene_cls = "CourseScene"
 
     def run(cmd_list, tail=3):
@@ -654,14 +654,27 @@ def run_pipeline(cfg, proj: Path, log):
             raise RuntimeError("步骤失败，见日志")
         return r
 
-    # 1 配音
-    log("步骤 1/4 生成声线克隆配音…")
-    tts_cmd = [str(tts_py), str(tools / "expressive_tts.py"), "分镜.md", "audio",
-               "--ref", ref, "--base-speed", str(cfg["tts_speed"])]
-    if cfg.get("ai_key"):
-        tts_cmd += ["--ai-key", cfg["ai_key"], "--ai-base", cfg.get("ai_base", ""),
-                    "--ai-model", cfg.get("ai_model", "")]
-    run(tts_cmd, tail=4)
+    # 1 配音：声纹文件已配置且克隆环境可用 → 声线克隆；否则 → 机器音色（edge-tts）
+    ref = str(cfg.get("ref_wav", "") or "").strip()
+    voice = str(cfg.get("tts_voice", "xiaoxiao") or "xiaoxiao").strip() or "xiaoxiao"
+    if ref and not Path(ref).exists():
+        log(f"警告：声纹文件不存在（{ref}），本次回退机器音色")
+        ref = ""
+    if ref and not tts_py.exists():
+        log("警告：未安装声线克隆环境（工具包缺 .venv-tts），本次回退机器音色")
+        ref = ""
+    if ref:
+        log(f"步骤 1/4 生成声线克隆配音…（声纹：{Path(ref).name}）")
+        tts_cmd = [str(tts_py), str(tools / "expressive_tts.py"), "分镜.md", "audio",
+                   "--ref", ref, "--base-speed", str(cfg["tts_speed"])]
+        if cfg.get("ai_key"):
+            tts_cmd += ["--ai-key", cfg["ai_key"], "--ai-base", cfg.get("ai_base", ""),
+                        "--ai-model", cfg.get("ai_model", "")]
+        run(tts_cmd, tail=4)
+    else:
+        log(f"步骤 1/4 生成机器音色配音（{voice}）…")
+        run([str(ven_py), str(tools / "generate_tts.py"), "分镜.md", "audio",
+             "--voice", voice])
     # 2 校验
     log("步骤 2/4 校验音频并回填时长…")
     run([str(ven_py), str(tools / "validate_audio.py"), "分镜.md", "audio"])
@@ -764,11 +777,17 @@ def gui_main(cfg):
     def refresh_status():
         tool = Path(cfg["tool_root"])
         ok_tool = (tool / ".venv-tts/Scripts/python.exe").exists() and (tool / ".venv/Scripts/python.exe").exists()
-        ok_ref = Path(cfg["ref_wav"]).exists()
+        ref = str(cfg.get("ref_wav", "") or "").strip()
+        if ref and Path(ref).exists():
+            voice = f"声线克隆（{Path(ref).name}）"
+        elif ref:
+            voice = "声线克隆（声纹文件缺失→回退机器音色）"
+        else:
+            voice = "机器音色"
         lib = Path(cfg["lessonlib"]) if cfg.get("lessonlib") else (EXE_DIR / "lessonlib.py")
         ok_lib = lib.exists()
         ai = "已配置" if cfg.get("ai_key") else "未配置（用本地模板生成稿件）"
-        stat.set(f"工具包：{'✓' if ok_tool else '✗ 找不到'}   声线：{'✓' if ok_ref else '✗'}   "
+        stat.set(f"工具包：{'✓' if ok_tool else '✗ 找不到'}   音色：{voice}   "
                  f"动画引擎：{'✓' if ok_lib else '✗ 缺 lessonlib.py'}   AI：{ai}")
 
     # ---- 顶部状态 ----
@@ -1184,9 +1203,10 @@ def gui_main(cfg):
                  "・在第2幕后加一页总结：把加法法则再练一遍\n"
                  "・修改第2幕读白为：……\n"
                  "・画质 m（l/m/h）    ・重新配音    ・重新渲染\n"
+                 "・改用机器音色        ・声纹：D:\\xx\\录音.wav（配置后自动声线克隆）\n"
                  "・打开输出文件夹    ・帮助\n"
                  "目标选「逐字稿」+ 配 AI Key：任何文字修改需求都由 AI 直接改逐字稿。\n"
-                 "目标选「视频」+ 配 AI Key：AI 理解生产类任务（重配/重渲/参数）。")
+                 "目标选「视频」+ 配 AI Key：AI 理解生产类任务（重配/重渲/参数/音色）。")
 
     def insert_summary(n, content):
         scenes = get_scenes()
@@ -1205,6 +1225,8 @@ def gui_main(cfg):
             return f"语速改到{v}"
         if op == "set_quality":
             return f"画质{v}"
+        if op == "set_voice":
+            return "改用机器音色" if str(v).lower() in ("machine", "机器音色", "") else f"声纹：{v}"
         if op == "delete_scene":
             return f"删除第{v}幕"
         if op == "insert_summary":
@@ -1257,6 +1279,22 @@ def gui_main(cfg):
             cfg["quality"] = m.group(1).lower()
             save_cfg(cfg)
             replies.append(f"画质已改为 {cfg['quality']}")
+        if re.search(r"机器音色|系统音色|关闭声线|不要克隆|不用克隆", task):
+            cfg["ref_wav"] = ""
+            cfg["tts_voice"] = cfg.get("tts_voice", "xiaoxiao")
+            save_cfg(cfg)
+            refresh_status()
+            replies.append("已切换为机器音色（对之后的配音生效；在「设置」里可换嗓音）")
+        m = re.search(r"(?:声纹|声线克隆|音色文件)[：:]?\s*(\S+\.(?:wav|mp3|m4a|flac))", task)
+        if m:
+            p = Path(m.group(1).strip().strip('"'))
+            if p.exists():
+                cfg["ref_wav"] = str(p)
+                save_cfg(cfg)
+                refresh_status()
+                replies.append(f"声纹已配置：{p.name}（之后自动声线克隆；填「机器音色」可切回）")
+            else:
+                replies.append(f"声纹文件不存在：{p}")
         if re.search(r"重新配音|重配", task):
             if scenes:
                 replies.append("开始重新配音并渲染（完成后弹窗提示）…")
@@ -1340,7 +1378,8 @@ def gui_main(cfg):
                             {"role": "system", "content":
                              "你是视频生产助手。用户给出任务，你返回 JSON："
                              '{"reply":"给用户的说明","actions":[{"op":"...","value":...}]}。'
-                             "可用 op：set_speed(0.6-1.3)、set_quality(l/m/h)、delete_scene(n)、"
+                             "可用 op：set_speed(0.6-1.3)、set_quality(l/m/h)、"
+                             "set_voice(\"machine\"=机器音色 或 声纹wav路径)、delete_scene(n)、"
                              "insert_summary(n,content)、edit_narr(n,text)、"
                              "regenerate_audio(重新配音并渲染)。"
                              "纯解释/咨询类任务把内容放 reply，actions 给空数组。"},
@@ -1410,9 +1449,10 @@ def gui_main(cfg):
     vars_cfg = {}
     fields = [
         ("tool_root", "教学视频工具包路径", 70),
-        ("ref_wav", "声线参考音频（本任务声线）", 70),
+        ("ref_wav", "声纹文件（留空=机器音色；配置后自动声线克隆）", 70),
         ("lessonlib", "lessonlib.py 路径（留空=程序同目录）", 70),
         ("output_root", "输出根目录", 70),
+        ("tts_voice", "机器音色嗓音（xiaoxiao/yunyang/yunxi/yunjian…）", 24),
         ("tts_speed", "配音语速（0.7~1.2，越小越慢）", 8),
         ("quality", "画质：l=480p / m=720p / h=1080p", 8),
     ]
