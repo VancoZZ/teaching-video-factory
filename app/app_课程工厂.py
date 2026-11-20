@@ -154,6 +154,8 @@ def gen_scenes_local(title, text):
         "narr": "本节课的主要内容就到这里。关键内容刚才已经逐条讲过，"
                 "请你课后完成配套练习，并把今天学到的内容讲给家人听。讲得出来，才是真的学会了。",
     })
+    for s in scenes:   # 本地模式：关键句自动加 **重点** 标记
+        s["narr_mark"] = _mark_key_sentences(s["narr"])
     return scenes
 
 
@@ -161,11 +163,15 @@ AI_SYSTEM = (
     "你是经验丰富的初中数学老师兼课程设计师。根据用户上传的资料文本，产出一份教学视频分镜稿。"
     "严格输出 JSON 数组（不要多余文字），每幕格式："
     '{"name":"幕名(不含空格)","kind":"title|bullets|steps|summary",'
-    '"narr":"配音读白(口语化,100~180字)","lines":["页面上的要点行"],'
+    '"narr":"配音读白(口语化,100~180字,内嵌表现标记)","lines":["页面上的要点行"],'
     '"main":"标题页主标题(kind=title时)","sub":"副标题(kind=title时)",'
     '"result":"结论行(kind=steps时)","hw":"作业(kind=summary时)"}'
     "要求：4~12 幕；第 1 幕 kind=title；最后 1 幕 kind=summary；"
     "中间 幕用 bullets（知识要点）或 steps（例题步骤）；读白面向六年级学生，老师口吻，直接可配音。"
+    "读白中必须使用表现标记（原样保留在 narr 字符串里）："
+    "**重点**=讲结论/答案/关键数字时放慢加重；!!逐字!!=极重要短语一字一顿；"
+    "[停0.8]=停顿0.8秒；[音:卷=倦]=多音字发音替换（同音字替换，字幕仍显示原字）。"
+    "每幕至少含 1 个 **重点** 或 [停] 标记。"
 )
 
 
@@ -188,7 +194,7 @@ def gen_scenes_ai(cfg, title, text):
     m = re.search(r"\[.*\]", out, re.S)
     scenes = json.loads(m.group(0))
     assert isinstance(scenes, list) and len(scenes) >= 3
-    return scenes
+    return split_narr_mark(scenes)
 
 
 AI_SYSTEM_VISION = (
@@ -196,7 +202,7 @@ AI_SYSTEM_VISION = (
     "（题目文字、图象、表格、数据），然后产出一份讲解视频分镜稿。"
     "严格输出 JSON 数组（不要多余文字），每幕格式："
     '{"name":"幕名(不含空格)","kind":"title|bullets|steps|summary",'
-    '"narr":"配音读白(口语化,100~180字)","lines":["页面上的要点行"],'
+    '"narr":"配音读白(口语化,100~180字,内嵌表现标记)","lines":["页面上的要点行"],'
     '"main":"标题页主标题(kind=title时)","sub":"副标题(kind=title时)",'
     '"result":"结论行(kind=steps时)","hw":"作业(kind=summary时)"}'
     "要求：5~14 幕；第 1 幕 kind=title（main=题目考点，sub=来源）；"
@@ -204,6 +210,10 @@ AI_SYSTEM_VISION = (
     "之后每小问/每步骤一幕 kind=steps（先审题分析，再给出答案，多空题逐空讲）；"
     "最后两幕：kind=warn（易错盘点）与 kind=summary（小结+hw 作业）。"
     "读白面向中学生，老师口吻，可直接配音。"
+    "读白中必须使用表现标记（原样保留在 narr 字符串里）："
+    "**重点**=讲结论/答案/关键数字时放慢加重；!!逐字!!=极重要短语一字一顿；"
+    "[停0.8]=停顿0.8秒；[音:卷=倦]=多音字发音替换（同音字替换，字幕仍显示原字）。"
+    "每幕至少含 1 个 **重点** 或 [停] 标记；最终答案用 !!逐字!! 包住。"
 )
 
 
@@ -245,7 +255,7 @@ def gen_scenes_ai_vision(cfg, title, image_paths, text=""):
     m = re.search(r"\[.*\]", out, re.S)
     scenes = json.loads(m.group(0))
     assert isinstance(scenes, list) and len(scenes) >= 3
-    return scenes
+    return split_narr_mark(scenes)
 
 
 def revise_scenes_ai(cfg, scenes, feedback):
@@ -254,7 +264,7 @@ def revise_scenes_ai(cfg, scenes, feedback):
         {"role": "user", "content": "现有分镜：\n" + json.dumps(scenes, ensure_ascii=False)
          + "\n\n修改需求：" + feedback}])
     m = re.search(r"\[.*\]", out, re.S)
-    return json.loads(m.group(0))
+    return split_narr_mark(json.loads(m.group(0)))
 
 
 def revise_scenes_local(scenes, feedback):
@@ -275,6 +285,134 @@ def revise_scenes_local(scenes, feedback):
         return scenes, f"已在第 {i} 幕后插入总结页"
     return None, ("本地模式支持的调整：\n・删除第N幕\n・在第N幕后加一页总结\n"
                   "・语速请在「设置」里改\n更多调整请在「设置」里填入 AI API Key")
+
+
+# ================= 逐字稿（带语气/停顿/发音标记） =================
+#
+# 标记符号规范（写在【读白】行内，生成视频时直通配音引擎）：
+#   **重点**      → 放慢语速并加重音量（讲结论/答案/关键数字）
+#   !!逐字!!      → 一字一顿（极重要的短语，如最终答案、口诀）
+#   [停0.8]       → 停顿 0.8 秒
+#   [音:卷=倦]    → 发音替换：合成时读「倦」，字幕仍显示「卷」
+
+SCRIPT_MARKUP_HELP = (
+    "逐字稿标记符号（写在【读白】行内）：\n"
+    "・**重点**      放慢语速+加重音量（结论/答案/关键数字）\n"
+    "・!!逐字!!      一字一顿（最终答案、口诀）\n"
+    "・[停0.8]       停顿 0.8 秒\n"
+    "・[音:卷=倦]    发音替换（合成读「倦」，字幕显示「卷」）")
+
+KEY_MARK_RE = re.compile(
+    r"(答案|结论|记住|切记|关键|注意|一定要|千万别|易错|所以|因此|等于|就填|选)")
+
+
+def _mark_key_sentences(narr):
+    """本地生成的读白：给关键句自动加 **重点** 标记。"""
+    parts = [p for p in re.split(r"(?<=[。！？])", narr) if p.strip()]
+    return "".join(f"**{p.strip()}**" if KEY_MARK_RE.search(p) else p
+                   for p in parts)
+
+
+KIND_ZH2EN = {"标题": "title", "要点": "bullets", "步骤": "steps",
+              "总结": "summary", "对比": "twocol", "正误": "warn",
+              "图形": "fig", "图形演示": "shapes"}
+KIND_EN2ZH = {v: k for k, v in KIND_ZH2EN.items()}
+KIND_VALID = ("title", "bullets", "steps", "summary", "twocol", "warn", "fig", "shapes")
+
+
+def split_narr_mark(scenes):
+    """把带标记的 narr 规范化：narr_mark=标记版（配音），narr=干净版（字幕）。"""
+    for s in scenes:
+        nm = s.get("narr_mark") or s.get("narr", "")
+        s["narr_mark"] = nm
+        s["narr"] = re.sub(r"\*\*|!!|\[停\d+(?:\.\d+)?\]|\[音:[^\]=]+=[^\]]+\]",
+                           "", nm).strip()
+    return scenes
+
+
+def scenes_to_script(title, scenes):
+    """scenes → 逐字稿文本（带标记符号）。narr_mark 优先于 narr。"""
+    out = [f"# 逐字稿：{title}", ""]
+    for i, s in enumerate(scenes, 1):
+        kind = s["kind"]
+        out.append(f"◆ 第{i}幕【{s['name']}｜{KIND_EN2ZH.get(kind, kind)}】")
+        if s.get("main"):
+            out.append(f"★ {s['main']}　{s.get('sub', '')}".rstrip())
+        for ln in s.get("lines", []):
+            out.append(f"· {ln}")
+        if s.get("result"):
+            out.append(f"⇒ {s['result']}")
+        if s.get("hw"):
+            out.append(f"□ {s['hw']}")
+        out.append(f"【读白】{s.get('narr_mark') or s.get('narr', '')}")
+        out.append("")
+    return "\n".join(out)
+
+
+def parse_script(text):
+    """逐字稿文本 → (title, scenes)。narr 带标记时自动拆出干净版（字幕）与标记版（配音）。"""
+    lines = text.replace("\r\n", "\n").split("\n")
+    title = ""
+    scenes, cur, errs = [], None, []
+
+    def flush():
+        nonlocal cur
+        if cur is not None:
+            if not cur["narr_mark"].strip():
+                errs.append(f"第{cur['no']}幕【{cur['name']}】缺【读白】行")
+            elif cur["name"] and not re.fullmatch(r"\S+", cur["name"]):
+                errs.append(f"第{cur['no']}幕名称含空格：{cur['name']}")
+            scenes.append(cur)
+        cur = None
+
+    for ln in lines:
+        m = re.match(r"#\s*逐字稿[:：](.+)", ln)
+        if m and not scenes:
+            title = m.group(1).strip()
+            continue
+        m = re.match(r"◆\s*第(\d+)幕【([^｜\]]+)｜([^】]+)】", ln)
+        if m:
+            flush()
+            kind_raw = m.group(3).strip()
+            kind = KIND_ZH2EN.get(kind_raw, kind_raw)
+            if kind not in KIND_VALID:
+                errs.append(f"第{m.group(1)}幕 kind 非法：{kind_raw}"
+                            f"（可用：{'/'.join(KIND_ZH2EN)} 或 {', '.join(KIND_VALID)}）")
+                kind = "bullets"
+            cur = {"no": int(m.group(1)), "name": m.group(2).strip(),
+                   "kind": kind, "lines": [], "narr_mark": ""}
+            continue
+        if cur is None:
+            continue
+        s = ln.strip()
+        if s.startswith("【读白】") or s.startswith("〔读白〕"):
+            cur["narr_mark"] = s.split("】", 1)[-1].split("〕", 1)[-1].strip()
+        elif s.startswith("★"):
+            parts = s[1:].split("　", 1)
+            cur["main"] = parts[0].strip()
+            if len(parts) > 1:
+                cur["sub"] = parts[1].strip()
+        elif s.startswith("⇒"):
+            cur["result"] = s[1:].strip()
+        elif s.startswith("□"):
+            cur["hw"] = s[1:].strip()
+        elif s.startswith("·"):
+            cur["lines"].append(s[1:].strip())
+        # 其余行忽略（空行/注释）
+    flush()
+
+    if errs:
+        raise ValueError("逐字稿格式有误：\n" + "\n".join(errs[:6]))
+    if len(scenes) < 2:
+        raise ValueError("逐字稿至少需要 2 幕（◆ 第N幕【名称｜要点】…【读白】…）。"
+                         "\n\n" + SCRIPT_MARKUP_HELP)
+    # 拆标记：narr=干净版（字幕），narr_mark=标记版（配音）
+    for s in scenes:
+        s["narr_mark"] = s["narr_mark"].replace("|", "，")
+        s["narr"] = re.sub(r"\*\*|!!|\[停\d+(?:\.\d+)?\]|\[音:[^\]=]+=[^\]]+\]",
+                           "", s["narr_mark"]).strip()
+        s.pop("no", None)
+    return title, scenes
 
 
 # ================= 工程生成 =================
@@ -354,7 +492,7 @@ class {scene_cls}(Scene):
 
     def run_scene(self, i, s):
         self.begin_scene(i)
-        vis = {{k: v for k, v in s.items() if k not in ("name", "narr")}}
+        vis = {{k: v for k, v in s.items() if k not in ("name", "narr", "narr_mark")}}
         used = present(self, vis)
         show_subtitles(self, s.get("narr", ""), used, self.sd(i))
         self.end_scene()
@@ -395,7 +533,7 @@ def build_project(cfg, title, scenes):
             "|------|--------|----------|------|--------|"]
     for i, s in enumerate(scenes, start=1):
         fname = f"audio_{i:03d}_{s['name'].replace(' ', '_')}.mp3"
-        narr = s["narr"].replace("|", "，")
+        narr = (s.get("narr_mark") or s["narr"]).replace("|", "，")
         rows.append(f'| {i} | {fname} | "{narr}" |  | clone |')
     (proj / "分镜.md").write_text("\n".join(rows), encoding="utf-8")
     # 稿件.md（人读版）
@@ -561,24 +699,52 @@ def gui_main(cfg):
     nb = ttk.Notebook(root)
     nb.pack(fill="both", expand=True)
 
-    # ================= Tab 1：生产流程 =================
+    # ================= Tab 1：逐字稿 =================
     tab1 = ttk.Frame(nb, padding=8)
-    nb.add(tab1, text="① 上传 → ② 稿件 → ③ 视频")
+    nb.add(tab1, text="① 上传 → 逐字稿")
+    tab_v = ttk.Frame(nb, padding=8)
+    nb.add(tab_v, text="② 逐字稿 → 视频")
 
-    tip = ("把文件拖到这里（Word / PDF / TXT / MD 直接生成；图片需在「设置」里配置"
-           "支持视觉的 AI API Key 才能读图出题），或点下方按钮选择。")
+    tip = ("把文件或整个文件夹拖到这里（拖文件夹会自动收集其中所有 PDF/图片/Word/TXT，"
+           "含子文件夹；图片需在「设置」里配置支持视觉的 AI API Key 才能读图出题），"
+           "或点下方按钮选择。")
     drop = tk.Listbox(tab1, height=6, relief="groove")
     drop.insert("end", tip)
     drop.pack(fill="x")
+
+    SUP_EXT = (".pdf", ".docx", ".txt", ".md",
+               ".png", ".jpg", ".jpeg", ".bmp", ".webp")
+
+    def _add_path(p):
+        """把一个路径加入列表；若是文件夹则递归收集目标文件。返回加入个数。"""
+        if p.is_dir():
+            found = sorted(q for q in p.rglob("*")
+                           if q.is_file() and q.suffix.lower() in SUP_EXT)
+            n = 0
+            for q in found:
+                if q not in state["files"]:
+                    state["files"].append(q)
+                    drop.insert("end", f"＋ {q}")
+                    n += 1
+            skipped = len(found) - n
+            note = f"📁 {p}：收集 {n} 个目标文件"
+            if skipped:
+                note += f"（{skipped} 个已在列表或重复，跳过）"
+            drop.insert("end", note)
+            return n
+        if p.suffix.lower() not in SUP_EXT:
+            messagebox.showwarning("不支持的类型", f"跳过：{p.name}")
+            return 0
+        if p in state["files"]:
+            return 0
+        state["files"].append(p)
+        drop.insert("end", f"＋ {p}")
+        return 1
+
     if HAS_DND:
         def on_drop(files):
             for p in files:
-                if p.suffix.lower() not in (".pdf", ".docx", ".txt", ".md",
-                                            ".png", ".jpg", ".jpeg", ".bmp", ".webp"):
-                    messagebox.showwarning("不支持的类型", f"跳过：{p.name}")
-                    continue
-                state["files"].append(p)
-                drop.insert("end", f"＋ {p}")
+                _add_path(p)
         hook_drop(drop, on_drop)
     else:
         drop.insert("end", "（拖拽不可用，请用「添加文件」按钮）")
@@ -587,13 +753,19 @@ def gui_main(cfg):
     def add_files():
         for f in filedialog.askopenfilenames(
                 filetypes=[("支持的文件", "*.pdf *.docx *.txt *.md *.png *.jpg *.jpeg")]):
-            state["files"].append(Path(f))
-            drop.insert("end", f"＋ {f}")
+            _add_path(Path(f))
+    def add_folder():
+        d = filedialog.askdirectory()
+        if d:
+            n = _add_path(Path(d))
+            if n == 0:
+                messagebox.showinfo("提示", "该文件夹（含子文件夹）里没有找到支持的目标文件。")
     ttk.Button(frow, text="添加文件", command=add_files).pack(side="left")
+    ttk.Button(frow, text="添加文件夹", command=add_folder).pack(side="left", padx=6)
     ttk.Button(frow, text="清空", command=lambda: (state["files"].clear(), drop.delete(1, "end"))).pack(side="left", padx=6)
 
-    # 稿件预览
-    ttk.Label(tab1, text="文字稿件（生成后可在此直接微调文字，点「应用稿件修改」生效）：").pack(anchor="w")
+    # 逐字稿预览/编辑（单一事实来源：视频模块从这里解析）
+    ttk.Label(tab1, text="逐字稿（生成后可直接编辑；【读白】行支持标记：**重点** !!逐字!! [停0.8] [音:卷=倦]）：").pack(anchor="w")
     draft = tk.Text(tab1, height=14, wrap="word")
     draft.pack(fill="both", expand=True)
 
@@ -652,21 +824,13 @@ def gui_main(cfg):
                         "没有提取到任何内容：可能全部是扫描版/图片型 PDF（整本书是图片）。\n"
                         "解决办法：① 在「设置」里配 AI Key 走 AI 读图；"
                         "② 或把书换成可复制文字的 PDF/Word 再拖入。")
-                state["scenes"] = scenes
                 state["title"] = title
 
                 def fill_draft():
                     draft.delete("1.0", "end")
-                    for i, s in enumerate(scenes, 1):
-                        draft.insert("end", f"◆ 第{i}幕【{s['name']}｜{s['kind']}】\n")
-                        for ln in s.get("lines", []):
-                            draft.insert("end", f"   · {ln}\n")
-                        if s.get("main"):
-                            draft.insert("end", f"   ★ {s['main']} {s.get('sub','')}\n")
-                        if s.get("result"):
-                            draft.insert("end", f"   ⇒ {s['result']}\n")
-                        draft.insert("end", f"   〔读白〕{s['narr']}\n\n")
-                    draftbox.set(f"稿件已生成：{len(scenes)} 幕（{src}）。确认内容后点「③ 生成视频」。")
+                    draft.insert("end", scenes_to_script(title, scenes))
+                    draftbox.set(f"逐字稿已生成：{len(scenes)} 幕（{src}）。可直接编辑，"
+                                 f"或到「② 逐字稿 → 视频」生成视频。")
                 ui(fill_draft)
                 log(f"稿件生成完成（{len(scenes)} 幕，来源：{src}）。可直接在上方文本框修改文字，"
                     f"或在底部任务框输入调整需求。")
@@ -677,46 +841,38 @@ def gui_main(cfg):
                 state["busy"] = False
         threading.Thread(target=work, daemon=True).start()
 
+    def get_scenes():
+        """逐字稿文本框 → scenes（解析失败抛 ValueError，带格式提示）。"""
+        _, sc = parse_script(draft.get("1.0", "end"))
+        return sc
+
+    def write_script(scenes, title=None):
+        t = title or state.get("title") or "未命名课程"
+        state["title"] = t
+        cur = draft.get("1.0", "end-1c")
+        pos = draft.index("insert")
+        draft.delete("1.0", "end")
+        draft.insert("end", scenes_to_script(t, scenes))
+        draft.mark_set("insert", pos)
+
     def do_apply_draft():
-        """把文本框的手工修改回写 scenes（按幕块解析）。"""
-        if state["busy"] or state["scenes"] is None:
+        """把文本框的手工修改解析回结构（校验格式并提示）。"""
+        if state["busy"]:
             return
         try:
-            content = draft.get("1.0", "end")
-            blocks = re.split(r"◆\s*第(\d+)幕【([^｜\]]+)｜(\w+)】", content)
-            new_scenes = []
-            it = iter(blocks[1:])
-            for idx, (num, name, kind) in enumerate(zip(it, it, it), 1):
-                body = next(it, "")
-                narr = ""
-                m = re.search(r"〔读白〕(.+)", body)
-                if m:
-                    narr = m.group(1).strip()
-                    body = body[:m.start()]
-                lines = [ln.strip().lstrip("·★⇒ ").strip() for ln in body.splitlines()
-                         if ln.strip() and not ln.strip().startswith("读白")]
-                s = dict(state["scenes"][idx - 1])
-                s["name"] = name.strip()
-                s["kind"] = kind.strip()
-                if lines:
-                    s["lines"] = lines
-                if narr:
-                    s["narr"] = narr
-                new_scenes.append(s)
-            if len(new_scenes) == len(state["scenes"]):
-                state["scenes"] = new_scenes
-                log("已应用你在文本框中的修改。")
-                messagebox.showinfo("完成", "修改已应用")
-            else:
-                messagebox.showwarning("未应用", f"解析到 {len(new_scenes)} 幕，与原稿 {len(state['scenes'])} 幕不一致，"
-                                                 "请勿增删『◆ 第N幕』行，只改行内文字。")
-        except Exception as e:
-            ui(lambda e=e: messagebox.showerror("应用失败", str(e)))
+            _, sc = parse_script(draft.get("1.0", "end"))
+            log(f"逐字稿校验通过：{len(sc)} 幕，标记符号将在配音时生效。")
+            messagebox.showinfo("校验通过", f"逐字稿格式正确：{len(sc)} 幕。\n"
+                                "生成视频时会自动按【读白】里的标记配音。")
+        except ValueError as e:
+            messagebox.showerror("逐字稿格式有误", str(e))
 
     def do_feedback_draft():
         """对话框：输入需求调整稿件。"""
-        if state["scenes"] is None:
-            messagebox.showwarning("提示", "请先生成稿件")
+        try:
+            scenes = get_scenes()
+        except ValueError as e:
+            messagebox.showerror("逐字稿格式有误", str(e))
             return
         win = tk.Toplevel(root); win.title("调整稿件"); win.geometry("520x220")
         ttk.Label(win, text="输入你的调整需求（例：语气更活泼／加一页关于XX的总结／删除第3幕／每幕更简短）"
@@ -729,45 +885,87 @@ def gui_main(cfg):
             if cfg.get("ai_key"):
                 def work():
                     try:
-                        scenes = revise_scenes_ai(cfg, state["scenes"], fb)
-                        state["scenes"] = scenes
-                        draft.delete("1.0", "end")
-                        for i, s in enumerate(scenes, 1):
-                            draft.insert("end", f"◆ 第{i}幕【{s['name']}｜{s['kind']}】\n")
-                            for ln in s.get("lines", []):
-                                draft.insert("end", f"   · {ln}\n")
-                            draft.insert("end", f"   〔读白〕{s['narr']}\n\n")
+                        scenes = revise_scenes_ai(cfg, scenes, fb)
+                        ui(lambda: write_script(scenes))
                         log("稿件已按需求调整（AI）。")
-                        win.destroy()
+                        ui(win.destroy)
                     except Exception as e:
                         ui(lambda e=e: messagebox.showerror("调整失败", str(e)))
                 threading.Thread(target=work, daemon=True).start()
             else:
-                new, msg = revise_scenes_local(state["scenes"], fb)
+                new, msg = revise_scenes_local(scenes, fb)
                 if new is None:
                     messagebox.showinfo("本地模式", msg)
                 else:
-                    state["scenes"] = new
+                    write_script(new)
                     log(f"稿件已调整：{msg}")
                     win.destroy()
         ttk.Button(win, text="应用调整", command=apply_fb).pack(pady=6)
 
-    ttk.Button(arow, text="① 生成文字稿件", command=do_gen_draft).pack(side="left")
-    ttk.Button(arow, text="应用稿件修改", command=do_apply_draft).pack(side="left", padx=6)
-    ttk.Button(arow, text="按需求调整稿件…", command=do_feedback_draft).pack(side="left")
+    ttk.Button(arow, text="① 生成逐字稿", command=do_gen_draft).pack(side="left")
+    ttk.Button(arow, text="校验格式", command=do_apply_draft).pack(side="left", padx=6)
+    ttk.Button(arow, text="按需求调整…", command=do_feedback_draft).pack(side="left")
+
+    def save_script():
+        t = state.get("title") or "未命名课程"
+        p = filedialog.asksaveasfilename(defaultextension=".md",
+                                         initialfile=f"逐字稿_{t}.md",
+                                         filetypes=[("Markdown", "*.md")])
+        if p:
+            Path(p).write_text(draft.get("1.0", "end-1c"), encoding="utf-8")
+            log(f"逐字稿已保存：{p}")
+
+    def load_script():
+        p = filedialog.askopenfilename(filetypes=[("逐字稿 / Markdown", "*.md *.txt")])
+        if not p:
+            return
+        try:
+            content = Path(p).read_text(encoding="utf-8")
+            title, sc = parse_script(content)
+        except (UnicodeDecodeError, ValueError) as e:
+            messagebox.showerror("加载失败", f"不是有效的逐字稿文件：\n{e}")
+            return
+        state["title"] = title or Path(p).stem
+        draft.delete("1.0", "end")
+        draft.insert("end", content)
+        draftbox.set(f"已加载逐字稿：{len(sc)} 幕（{p}）。可直接到「② 逐字稿 → 视频」生成视频。")
+        log(f"逐字稿已加载：{p}（{len(sc)} 幕）")
+
+    ttk.Button(arow, text="保存逐字稿", command=save_script).pack(side="left", padx=6)
+    ttk.Button(arow, text="加载逐字稿", command=load_script).pack(side="left")
+    ttk.Button(arow, text="标记说明", command=lambda: messagebox.showinfo(
+        "逐字稿标记符号", SCRIPT_MARKUP_HELP)).pack(side="left", padx=6)
     draftbox = tk.StringVar()
     ttk.Label(tab1, textvariable=draftbox, foreground="#1565c0").pack(anchor="w")
 
-    vrow = ttk.Frame(tab1); vrow.pack(fill="x", pady=6)
+    # ---- Tab 2：视频 ----
+    ttk.Label(tab_v, text="从「① 上传 → 逐字稿」的逐字稿生成视频（也可「加载逐字稿」直接开始）。"
+            ).pack(anchor="w")
+    vinfo = tk.StringVar(value="当前逐字稿：尚未加载")
+    ttk.Label(tab_v, textvariable=vinfo, foreground="#1565c0").pack(anchor="w", pady=(2, 8))
+
+    def refresh_vinfo():
+        try:
+            _, sc = parse_script(draft.get("1.0", "end"))
+            n_mark = sum(1 for s in sc if s.get("narr_mark") and
+                         re.search(r"\*\*|!!|\[停|\[音:", s["narr_mark"]))
+            vinfo.set(f"当前逐字稿：{len(sc)} 幕，其中 {n_mark} 幕含语气/停顿/发音标记")
+        except ValueError:
+            vinfo.set("当前逐字稿：格式未通过校验（回「①」页点「校验格式」查看原因）")
+
     def do_video():
-        if state["busy"] or state["scenes"] is None:
-            messagebox.showwarning("提示", "请先生成（或调整）稿件")
+        if state["busy"]:
+            return
+        try:
+            scenes = get_scenes()
+        except ValueError as e:
+            messagebox.showerror("逐字稿格式有误", str(e))
             return
         state["busy"] = True
         btnv.configure(state="disabled")
         def work():
             try:
-                proj = build_project(cfg, state["title"], state["scenes"])
+                proj = build_project(cfg, state.get("title") or "未命名课程", scenes)
                 state["proj"] = proj
                 log(f"工程目录：{proj}")
                 video = run_pipeline(cfg, proj, log)
@@ -787,6 +985,11 @@ def gui_main(cfg):
         if state["proj"] is None:
             messagebox.showwarning("提示", "请先生成视频")
             return
+        try:
+            scenes = get_scenes()
+        except ValueError as e:
+            messagebox.showerror("逐字稿格式有误", str(e))
+            return
         win = tk.Toplevel(root); win.title("调整视频"); win.geometry="520x260"
         win.geometry("520x260")
         ttk.Label(win, text="选择调整方式：").pack(anchor="w", padx=10, pady=8)
@@ -795,7 +998,6 @@ def gui_main(cfg):
         ttk.Radiobutton(win, text="只改语速（重新配音+重渲染）", variable=v, value="speed").pack(anchor="w", padx=20)
         ttk.Radiobutton(win, text="用 AI 按需求重写稿件并重渲染", variable=v, value="ai").pack(anchor="w", padx=20)
         rowf = ttk.Frame(win); rowf.pack(fill="x", padx=10)
-        scenes = state["scenes"]
         combo = ttk.Combobox(rowf, values=[f"第{i+1}幕 {s['name']}" for i, s in enumerate(scenes)],
                              state="readonly", width=28)
         if scenes:
@@ -803,53 +1005,52 @@ def gui_main(cfg):
         combo.pack(side="left")
         txt = tk.Text(win, height=6); txt.pack(fill="both", expand=True, padx=10, pady=4)
         if scenes:
-            txt.insert("1.0", scenes[0]["narr"])
+            txt.insert("1.0", scenes[0].get("narr_mark") or scenes[0]["narr"])
         def on_combo(evt):
             i = combo.current()
-            txt.delete("1.0", "end"); txt.insert("1.0", scenes[i]["narr"])
+            txt.delete("1.0", "end")
+            txt.insert("1.0", scenes[i].get("narr_mark") or scenes[i]["narr"])
         combo.bind("<<ComboboxSelected>>", on_combo)
         def rerender():
             try:
                 if v.get() == "text":
                     i = combo.current()
-                    state["scenes"][i]["narr"] = txt.get("1.0", "end").strip()
+                    scenes[i]["narr_mark"] = txt.get("1.0", "end").strip()
+                    scenes[i]["narr"] = re.sub(
+                        r"\*\*|!!|\[停\d+(?:\.\d+)?\]|\[音:[^\]=]+=[^\]]+\]",
+                        "", scenes[i]["narr_mark"]).strip()
+                    write_script(scenes)
                 elif v.get() == "ai":
                     fb = txt.get("1.0", "end").strip()
                     if cfg.get("ai_key") and fb:
-                        state["scenes"] = revise_scenes_ai(cfg, state["scenes"], fb)
+                        scenes = revise_scenes_ai(cfg, scenes, fb)
+                        write_script(scenes)
                     else:
                         messagebox.showwarning("提示", "AI 未配置或需求为空"); return
                 # 重建工程（语速从设置读取）
-                proj = build_project(cfg, state["title"], state["scenes"])
+                proj = build_project(cfg, state.get("title") or "未命名课程", scenes)
                 state["proj"] = proj
                 video = run_pipeline(cfg, proj, log)
                 state["video"] = video
-                messagebox.showinfo("完成", f"新视频已生成：\n{video}")
+                ui(lambda v=video: messagebox.showinfo("完成", f"新视频已生成：\n{v}"))
                 win.destroy()
             except Exception as e:
                 ui(lambda e=e: messagebox.showerror("失败", str(e)))
         ttk.Button(win, text="重新配音并渲染", command=rerender).pack(pady=6)
 
-    btnv = ttk.Button(vrow, text="③ 生成视频", command=do_video)
+    vrow = ttk.Frame(tab_v); vrow.pack(fill="x", pady=6)
+    btnv = ttk.Button(vrow, text="② 生成视频", command=do_video)
     btnv.pack(side="left")
     ttk.Button(vrow, text="调整视频…", command=do_video_feedback).pack(side="left", padx=6)
     ttk.Button(vrow, text="打开输出文件夹", command=lambda: os.startfile(cfg["output_root"])).pack(side="left")
+    ttk.Button(vrow, text="刷新逐字稿状态", command=refresh_vinfo).pack(side="left", padx=6)
 
     # ---- 通用任务对话框 ----
     def render_draft_view():
-        scenes = state.get("scenes")
-        if scenes is None:
-            return
-        draft.delete("1.0", "end")
-        for i, s in enumerate(scenes, 1):
-            draft.insert("end", f"◆ 第{i}幕【{s['name']}｜{s['kind']}】\n")
-            for ln in s.get("lines", []):
-                draft.insert("end", f"   · {ln}\n")
-            if s.get("main"):
-                draft.insert("end", f"   ★ {s['main']} {s.get('sub','')}\n")
-            if s.get("result"):
-                draft.insert("end", f"   ⇒ {s['result']}\n")
-            draft.insert("end", f"   〔读白〕{s['narr']}\n\n")
+        try:
+            write_script(get_scenes())
+        except ValueError:
+            pass   # 格式未通过时不动文本框
 
     TASK_HELP = ("本地指令（免 Key，输入即执行）：\n"
                  "・语速改到0.8        ・删除第3幕\n"
@@ -857,16 +1058,18 @@ def gui_main(cfg):
                  "・修改第2幕读白为：……\n"
                  "・画质 m（l/m/h）    ・重新配音    ・重新渲染\n"
                  "・打开输出文件夹    ・帮助\n"
-                 "其他任何需求：配置 AI Key 后由 AI 理解并执行。")
+                 "目标选「逐字稿」+ 配 AI Key：任何文字修改需求都由 AI 直接改逐字稿。\n"
+                 "目标选「视频」+ 配 AI Key：AI 理解生产类任务（重配/重渲/参数）。")
 
     def insert_summary(n, content):
-        scenes = state["scenes"]
+        scenes = get_scenes()
         n = min(max(n, 1), len(scenes) + 1)
         scenes.insert(n, {"name": "补充要点", "kind": "summary",
                           "lines": [x.strip() for x in re.split(r"[;；]", content) if x.strip()] or ["要点回顾"],
                           "hw": "完成配套练习",
-                          "narr": f"我们把{content}再梳理一遍，请对照屏幕自查掌握情况。"})
-        return n
+                          "narr": f"我们把{content}再梳理一遍，请对照屏幕自查掌握情况。",
+                          "narr_mark": f"我们把{content}再梳理一遍，**请对照屏幕自查掌握情况**。"})
+        return n, scenes
 
     def _act_to_task(act):
         op = act.get("op", "")
@@ -888,7 +1091,11 @@ def gui_main(cfg):
     def execute_task(task):
         """解析并执行任务，返回回复列表（调用者线程执行，UI 走 ui()）。"""
         replies = []
-        scenes = state.get("scenes")
+        try:
+            scenes = get_scenes()
+        except ValueError as e:
+            scenes = None
+            replies.append(f"逐字稿格式有误（AI/本地改稿前请先修正）：{str(e).splitlines()[0]}")
         m = re.search(r"语速\s*(?:改到|到|设为|=|：)?\s*(0\.\d+|1(?:\.0+)?)", task)
         if m:
             v = max(0.6, min(1.3, float(m.group(1))))
@@ -900,20 +1107,23 @@ def gui_main(cfg):
             n = int(m.group(1))
             if 1 <= n <= len(scenes):
                 removed = scenes.pop(n - 1)
-                ui(render_draft_view)
+                ui(lambda: write_script(scenes))
                 replies.append(f"已删除第 {n} 幕（{removed['name']}）")
         m = re.search(r"在第(\d+)幕(?:后|后面|之后)(?:加|插入)(?:一页)?(?:总结|要点|内容)?[:：]?(.*)", task)
         if m and scenes:
             content = m.group(2).strip() or "本次课程要点回顾"
-            n = insert_summary(int(m.group(1)), content)
-            ui(render_draft_view)
+            n, new_scenes = insert_summary(int(m.group(1)), content)
+            ui(lambda: write_script(new_scenes))
             replies.append(f"已在第 {n} 幕后插入总结页（{content}）")
         m = re.search(r"修改第(\d+)幕(?:的)?读白为[:：]?(.+)", task)
         if m and scenes:
             n = int(m.group(1))
             if 1 <= n <= len(scenes):
-                state["scenes"][n - 1]["narr"] = m.group(2).strip()
-                ui(render_draft_view)
+                scenes[n - 1]["narr_mark"] = m.group(2).strip()
+                scenes[n - 1]["narr"] = re.sub(
+                    r"\*\*|!!|\[停\d+(?:\.\d+)?\]|\[音:[^\]=]+=[^\]]+\]",
+                    "", scenes[n - 1]["narr_mark"]).strip()
+                ui(lambda: write_script(scenes))
                 replies.append(f"已修改第 {n} 幕读白（记得「重新配音」生效）")
         m = re.search(r"画质\s*(?:改到|到|设为|=|：)?\s*([lmhLMH])\b", task)
         if m:
@@ -921,21 +1131,21 @@ def gui_main(cfg):
             save_cfg(cfg)
             replies.append(f"画质已改为 {cfg['quality']}")
         if re.search(r"重新配音|重配", task):
-            if state.get("scenes"):
+            if scenes:
                 replies.append("开始重新配音并渲染（完成后弹窗提示）…")
 
                 def _regen():
                     try:
-                        proj = build_project(cfg, state["title"], state["scenes"])
+                        proj = build_project(cfg, state.get("title") or "未命名课程", scenes)
                         state["proj"] = proj
                         video = run_pipeline(cfg, proj, log)
                         state["video"] = video
-                        ui(lambda: messagebox.showinfo("完成", f"新视频已生成：\n{video}"))
+                        ui(lambda v=video: messagebox.showinfo("完成", f"新视频已生成：\n{v}"))
                     except Exception as e:
                         ui(lambda e=e: messagebox.showerror("重新配音失败", str(e)))
                 threading.Thread(target=_regen, daemon=True).start()
             else:
-                replies.append("还没有稿件：先点「① 生成文字稿件」")
+                replies.append("还没有逐字稿：先到「①」页生成或「加载逐字稿」")
         elif re.search(r"重新渲染", task):
             if state.get("proj"):
                 replies.append("开始重新渲染…")
@@ -949,7 +1159,7 @@ def gui_main(cfg):
                         ui(lambda e=e: messagebox.showerror("重渲染失败", str(e)))
                 threading.Thread(target=_rerender, daemon=True).start()
             else:
-                replies.append("还没有工程：先「③ 生成视频」")
+                replies.append("还没有工程：先到「② 视频」页生成")
         if re.search(r"打开(输出)?文件夹", task):
             os.startfile(cfg["output_root"])
             replies.append("已打开输出文件夹")
@@ -957,12 +1167,45 @@ def gui_main(cfg):
             replies.append(TASK_HELP)
         if not replies:
             if cfg.get("ai_key"):
+                if state.get("chat_target") == "script":
+                    replies.append("AI 正在修改逐字稿…")
+
+                    def _ai_script():
+                        try:
+                            cur = draft.get("1.0", "end-1c")
+                            out = call_ai(cfg, [
+                                {"role": "system", "content":
+                                 "你是教学逐字稿编辑。用户给出当前逐字稿全文和修改需求，"
+                                 "输出修改后的完整逐字稿。保持格式：每幕为"
+                                 "『◆ 第N幕【名称｜kind】』（kind 可用 标题/要点/步骤/总结/对比/正误），"
+                                 "画面行以 · 开头，结论行以 ⇒ 开头，每幕必有一行【读白】。"
+                                 "【读白】行内可用表现标记：**重点**（放慢加重）、!!逐字!!（一字一顿）、"
+                                 "[停0.8]（停顿）、[音:卷=倦]（发音替换，正文仍写原字）。"
+                                 "只输出逐字稿正文，不要解释。"},
+                                {"role": "user",
+                                 "content": f"当前逐字稿：\n{cur[:9000]}\n\n修改需求：{task}"}])
+                            _, sc = parse_script(out)
+                            ui(lambda: (draft.delete("1.0", "end"),
+                                        draft.insert("end", out),
+                                        refresh_vinfo()))
+                            replies.append(f"AI 已改好逐字稿（{len(sc)} 幕），已更新到编辑框。")
+                            log("AI 逐字稿修改完成。")
+                        except ValueError as e:
+                            replies.append(f"AI 返回的逐字稿格式不合规，已保留原稿：\n{e}")
+                        except Exception as e:
+                            replies.append(f"AI 修改失败：{e}")
+                    threading.Thread(target=_ai_script, daemon=True).start()
+                    return replies
                 replies.append("AI 正在理解任务…")
 
                 def _ai():
                     try:
-                        scenes = state.get("scenes")
-                        ctx = {"有稿件": scenes is not None,
+                        scenes = None
+                        try:
+                            scenes = get_scenes()
+                        except ValueError:
+                            pass
+                        ctx = {"有逐字稿": scenes is not None,
                                "幕数": len(scenes) if scenes else 0,
                                "语速": cfg["tts_speed"], "画质": cfg["quality"],
                                "有已生成视频": state.get("video") is not None}
@@ -990,20 +1233,29 @@ def gui_main(cfg):
                 replies.append("没有匹配的本地指令。\n" + TASK_HELP)
         return replies
 
-    # ---- 任务框 UI ----
-    ttk.Label(tab1, text="任务对话框：一句话告诉我要执行的任务 / 要修改的地方（输入后回车或点「执行任务」）：").pack(anchor="w")
-    trow = ttk.Frame(tab1)
-    trow.pack(fill="x")
-    task_var = tk.StringVar()
-    task_entry = ttk.Entry(trow, textvariable=task_var)
-    task_entry.pack(side="left", fill="x", expand=True)
+    # ---- AI 对话框（共享于两个 Tab，直接对接 API） ----
+    ttk.Label(root, text="AI 对话　目标：").pack(anchor="w", padx=8, pady=(6, 0))
+    brow = ttk.Frame(root)
+    brow.pack(fill="x", padx=8)
+    chat_target = ttk.Combobox(brow, values=["逐字稿", "视频"], state="readonly",
+                               width=8)
+    chat_target.current(0)
+    chat_target.pack(side="left")
+    state["chat_target"] = "script"
+    chat_var = tk.StringVar()
+    chat_entry = ttk.Entry(brow, textvariable=chat_var)
+    chat_entry.pack(side="left", fill="x", expand=True, padx=6)
+
+    def _on_target(evt):
+        state["chat_target"] = "script" if chat_target.get() == "逐字稿" else "video"
+    chat_target.bind("<<ComboboxSelected>>", _on_target)
 
     def run_task():
-        task = task_var.get().strip()
+        task = chat_var.get().strip()
         if not task or state.get("task_busy"):
             return
         state["task_busy"] = True
-        log(f"任务：{task}")
+        log(f"任务[{chat_target.get()}]：{task}")
 
         def work():
             try:
@@ -1016,13 +1268,13 @@ def gui_main(cfg):
             finally:
                 state["task_busy"] = False
         threading.Thread(target=work, daemon=True).start()
-    ttk.Button(trow, text="执行任务", command=run_task).pack(side="left", padx=4)
-    task_entry.bind("<Return>", lambda e: run_task())
+    ttk.Button(brow, text="发送", command=run_task).pack(side="left", padx=4)
+    chat_entry.bind("<Return>", lambda e: run_task())
 
     # 日志
-    ttk.Label(tab1, text="运行日志：").pack(anchor="w")
-    logbox = tk.Text(tab1, height=8, state="disabled", background="#111", foreground="#cfc")
-    logbox.pack(fill="x")
+    ttk.Label(root, text="运行日志：").pack(anchor="w", padx=8)
+    logbox = tk.Text(root, height=6, state="disabled", background="#111", foreground="#cfc")
+    logbox.pack(fill="x", padx=8, pady=(0, 6))
 
     # ================= Tab 2：设置 =================
     tab2 = ttk.Frame(nb, padding=12)
@@ -1079,13 +1331,14 @@ def gui_main(cfg):
     ttk.Button(tab2, text="测试 AI 连接", command=test_ai).pack(anchor="w")
 
     stat.set(stat.get() + f"   配置文件：{CFG_PATH}")
-    log("欢迎使用课程工厂。流程：拖入文件 → ①生成稿件（可调整）→ ③生成视频（可再调整）。")
+    log("欢迎使用课程工厂。两步走：①上传→逐字稿（可编辑/标记语气停顿）→ ②逐字稿→视频。"
+        "也可以「加载逐字稿」直接出片；底部对话框可对话式修改（配 AI Key 后由 AI 执行）。")
     root.mainloop()
 
 
 def selftest(cfg):
     """无界面端到端自测。"""
-    print("== selftest: 生成稿件")
+    print("== selftest: 逐字稿往返")
     text = ("有理数的加法法则。同号相加，符号不变，绝对值相加。"
             "例如负二加负三等于负五。\n\n"
             "异号相加，符号随绝对值大的一方，绝对值相减。"
@@ -1093,8 +1346,13 @@ def selftest(cfg):
             "减去一个数，等于加上它的相反数。"
             "例如三减七等于负四。减去负数等于加正数，结果反而变大。")
     scenes = gen_scenes_local("有理数的加减法", text)
-    print(f"scenes: {len(scenes)} 幕")
-    proj = build_project(cfg, "有理数的加减法", scenes)
+    script_txt = scenes_to_script("有理数的加减法", scenes)
+    assert "**" in script_txt, "本地逐字稿应含 **重点** 标记"
+    t2, sc2 = parse_script(script_txt)
+    assert t2 == "有理数的加减法" and len(sc2) == len(scenes)
+    assert all(s.get("narr_mark") and s["narr"] for s in sc2)
+    print(f"scenes: {len(sc2)} 幕，逐字稿往返 OK")
+    proj = build_project(cfg, "有理数的加减法", sc2)
     print("proj:", proj)
     print("== selftest: 渲染管线")
     out = run_pipeline(cfg, proj, lambda m: print("  " + m))
