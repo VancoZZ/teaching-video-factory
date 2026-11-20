@@ -48,6 +48,32 @@
 > 仓库中的脚本默认路径是作者的本机布局（`D:\视频生成\教学视频工具包` 等），
 > 可通过环境变量/程序内设置修改，或直接按目录结构摆放。
 
+## 一键部署（新电脑推荐）
+
+不用手工建环境，克隆本仓库后双击两个 bat 即可：
+
+```bat
+git clone https://github.com/VancoZZ/teaching-video-factory.git
+cd teaching-video-factory
+
+一键安装.bat          REM 装 .venv（manim 渲染管线）+ 组装 工具脚本/ 与 声线参考/
+安装声线克隆.bat      REM 可选：装 .venv-tts（F5-TTS 声线克隆，约 4GB 下载，需 NVIDIA GPU）
+```
+
+装完后：
+
+1. 双击 `课程工厂.exe`（到 Release / `app/` 自行 PyInstaller 打包），
+   「设置」→「教学视频工具包路径」**指向本仓库目录**即可
+2. 「声线参考/」目录放你自己的 15~30s 干净录音（仓库不含任何声线样本）
+3. AI 设置填任意 OpenAI 兼容服务（读图出题需视觉模型，如 `glm-4.5v`）
+   —— 示例：地址 `https://open.bigmodel.cn/api/paas/v4`
+
+说明：
+- F5-TTS 模型权重（约 1.4GB）不在仓库内，`安装声线克隆.py` 会自动从 hf-mirror.com
+  下载到 `ckpts/`；F5-TTS 推理源码已内置（`f5tts_src/`）
+- 无网络环境：把本机 `教学视频工具包/wheels/`（130MB 离线 whl）一并拷过去，装器自动离线安装
+- 没有 NVIDIA GPU 也能出片，克隆会退回 CPU 模式（慢 10 倍以上）
+
 ## 快速开始（三步出片）
 
 ```bash
