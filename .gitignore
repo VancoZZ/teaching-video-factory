@@ -11,4 +11,5 @@ build/课程工厂/
 *.wav
 *.safetensors
 课程工厂_配置.json
-声线参考/
+声线参考/*
+!声线参考/README.txt
