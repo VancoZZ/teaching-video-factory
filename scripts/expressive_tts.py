@@ -46,6 +46,51 @@ def apply_poly(text):
     return text
 
 
+# ---------------- 逐字稿内嵌标记（**重点** / !!逐字!! / [停x] / [音:…=…]） ----------------
+
+MARKUP_SPLIT_RE = re.compile(
+    r"(\*\*.+?\*\*|!!.+?!!|\[停\d+(?:\.\d+)?\]|\[音:[^\]=]+=[^\]]+\])")
+STOP_RE = re.compile(r"\[停(\d+(?:\.\d+)?)\]")
+PRON_RE = re.compile(r"\[音:([^=\]]+)=([^\]]+)\]")
+
+
+def has_markup(narr):
+    return bool(MARKUP_SPLIT_RE.search(narr))
+
+
+def markup_annotate(narr):
+    """带标记的读白 → 分段。[停x] 生成静音段，[音:A=B] 声明本幕发音替换规则。"""
+    rules = PRON_RE.findall(narr)          # 先取规则
+    narr = PRON_RE.sub("", narr)           # 再删标记（避免规则字面被污染）
+    for a, b in rules:                     # 最后对剩余文本做同音字替换
+        narr = narr.replace(a, b)
+    segs = []
+    for p in MARKUP_SPLIT_RE.split(narr):
+        if not p or not p.strip():
+            continue
+        m = STOP_RE.fullmatch(p.strip())
+        if m:
+            segs.append({"sil": float(m.group(1))})
+        elif p.startswith("**") and p.endswith("**") and p[2:-2].strip():
+            segs.append({"t": p[2:-2].strip(), "st": "k"})
+        elif p.startswith("!!") and p.endswith("!!") and p[2:-2].strip():
+            segs.append({"t": p[2:-2].strip(), "st": "s"})
+        else:
+            clean = p.strip()
+            if clean:
+                segs.append({"t": clean, "st": "n"})
+    # 纯标点的 n 段并入前一段（避免孤立的「。」单独合成）
+    merged = []
+    for seg in segs:
+        if ("t" in seg and seg.get("st") == "n"
+                and not re.search(r"[\u4e00-\u9fffA-Za-z0-9]", seg["t"])
+                and merged and "t" in merged[-1]):
+            merged[-1]["t"] += seg["t"]
+        else:
+            merged.append(seg)
+    return merged or [{"t": narr, "st": "n"}]
+
+
 # ---------------- 分段标注（无 AI：规则引擎） ----------------
 KEY_WORDS = re.compile(
     r"答案|结论|记住|切记|关键|注意|一定要|千万别|易错|错在|最重要|"
@@ -123,9 +168,19 @@ def spell_text(t):
 
 
 def synth_segments(cloner, ref, ref_text, segs, base_speed, tmpdir):
-    """逐段合成，返回 (wav 路径列表, 音量列表)。"""
+    """逐段合成，返回 (wav 路径列表, 音量列表)。含静音段（{"sil": 秒}）。"""
     files, vols = [], []
+    ff = get_ffmpeg()
     for j, seg in enumerate(segs):
+        if seg.get("sil"):
+            out = tmpdir / f"seg_{j:03d}_sil.wav"
+            subprocess.run([ff, "-y", "-hide_banner", "-loglevel", "error",
+                            "-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono",
+                            "-t", str(seg["sil"]), str(out)],
+                           check=True, capture_output=True)
+            files.append(out)
+            vols.append(1.0)
+            continue
         st = seg.get("st", "n")
         text = apply_poly(seg["t"])
         if st == "s":
@@ -149,7 +204,7 @@ def concat_volume(ff, files, vols, out_wav):
     inputs, fc_parts, concat = [], [], ""
     for i, (f, v) in enumerate(zip(files, vols)):
         inputs += ["-i", str(f)]
-        fc_parts.append(f"[{i}:a]volume={v}[a{i}]")
+        fc_parts.append(f"[{i}:a]volume={v},aresample=24000,aformat=channel_layouts=mono[a{i}]")
         concat += f"[a{i}]"
     fc = ";".join(fc_parts) + f";{concat}concat=n={n}:v=0:a=1[out]"
     cmd = [ff, "-y", "-hide_banner", "-loglevel", "error"] + inputs + \
@@ -184,8 +239,9 @@ def main():
     ref_text = get_ref_text(ref, ref.parent, "cuda" if os.environ.get("CUDA_OK", "1") else "cpu")
 
     narrs = [tx for _, tx in entries]
+    marked = [has_markup(n) for n in narrs]
     segs_all = None
-    if args.ai_key:
+    if args.ai_key and not all(marked):
         try:
             print("[AI] 配音导演标注中…")
             segs_all = ai_annotate_all(
@@ -197,6 +253,14 @@ def main():
     if segs_all is None:
         segs_all = [heuristic_annotate(n) for n in narrs]
         print("[规则] 使用启发式分段标注")
+    # 带内嵌标记的读白按标记分段（标记优先级最高）
+    n_marked = 0
+    for i, mk in enumerate(marked):
+        if mk:
+            segs_all[i] = markup_annotate(narrs[i])
+            n_marked += 1
+    if n_marked:
+        print(f"[标记] {n_marked} 幕读白含逐字稿标记（**重点**/!!逐字!!/[停]/[音:]），按标记分段")
 
     tmpdir = Path(tempfile.mkdtemp(prefix="expr_tts_"))
     results, total, t_start = [], 0.0, time.time()
