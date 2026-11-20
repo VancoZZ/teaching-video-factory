@@ -15,8 +15,10 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -53,10 +55,12 @@ def save_cfg(cfg):
 
 
 def clean_env():
-    """子进程环境：剥 PYTHONPATH（防 venv 污染）、关 safe-delete 拦截。"""
+    """子进程环境：剥 PYTHONPATH（防 venv 污染）、关 safe-delete 拦截、强制 UTF-8 输出（防 GBK 崩溃）。"""
     env = {k: v for k, v in os.environ.items()
            if k not in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP")}
     env["CODEBUDDY_SAFE_DELETE_SANDBOX"] = "0"
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
     return env
 
 
@@ -103,6 +107,27 @@ def extract_text(path: Path, progress=None) -> str:
     if ext in (".png", ".jpg", ".jpeg", ".bmp", ".webp"):
         return ""  # 图片无法本地 OCR；提示用户配 AI 或另附文字
     raise ValueError(f"暂不支持的文件类型：{ext}")
+
+
+def pdf_pages_to_images(path: Path, max_pages=4, dpi=140):
+    """扫描版 PDF 兜底：渲染前 max_pages 页为 PNG，交给 AI 视觉读图。"""
+    try:
+        import pypdfium2 as pdfium
+    except ImportError:
+        return []
+    try:
+        pdf = pdfium.PdfDocument(str(path))
+        tmpd = Path(tempfile.gettempdir()) / "课程工厂_扫描页"
+        tmpd.mkdir(exist_ok=True)
+        out = []
+        for i in range(min(len(pdf), max_pages)):
+            bmp = pdf[i].render(scale=dpi / 72)
+            f = tmpd / f"{path.stem[:20]}_{i + 1:02d}.png"
+            bmp.to_pil().save(f)
+            out.append(f)
+        return out
+    except Exception:
+        return []
 
 
 # ================= 稿件生成（本地模板引擎） =================
@@ -175,16 +200,38 @@ AI_SYSTEM = (
 )
 
 
-def call_ai(cfg, messages, timeout=120):
+def call_ai(cfg, messages, timeout=None, retries=1):
+    """timeout=None = 不限时（大图/多图读图可能很慢，交给 AI 慢慢算）。"""
     base = cfg["ai_base"].rstrip("/")
+    # 容错：base_url 误填成完整端点时自动剥掉 /chat/completions
+    if base.endswith("/chat/completions"):
+        base = base[: -len("/chat/completions")]
     url = f"{base}/chat/completions"
     body = json.dumps({"model": cfg["ai_model"], "messages": messages, "temperature": 0.4}).encode("utf-8")
-    req = urllib.request.Request(url, data=body, method="POST",
-                                 headers={"Content-Type": "application/json",
-                                          "Authorization": f"Bearer {cfg['ai_key']}"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-    return data["choices"][0]["message"]["content"]
+    last_err = None
+    for attempt in range(1 + retries):
+        if attempt:
+            time.sleep(3)
+        req = urllib.request.Request(url, data=body, method="POST",
+                                     headers={"Content-Type": "application/json",
+                                              "Authorization": f"Bearer {cfg['ai_key']}"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            return data["choices"][0]["message"]["content"]
+        except urllib.error.HTTPError as e:
+            detail = ""
+            try:
+                detail = e.read().decode("utf-8", "ignore")[:300]
+            except Exception:
+                pass
+            last_err = RuntimeError(
+                f"AI 接口返回错误 {e.code}：{detail or e}（模型：{cfg.get('ai_model')}）")
+            if e.code not in (429, 500, 502, 503, 504):
+                raise last_err from None     # 4xx 类（Key/权限/参数）重试无意义
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            last_err = RuntimeError(f"AI 接口网络错误：{e}（模型：{cfg.get('ai_model')}）")
+    raise last_err
 
 
 def gen_scenes_ai(cfg, title, text):
@@ -239,13 +286,20 @@ def _image_to_data_url(path, max_side=1500, quality=85):
 
 def gen_scenes_ai_vision(cfg, title, image_paths, text=""):
     """图片题目 → 视觉模型读图 → 分镜稿。需要支持视觉的模型（如 gpt-4o、qwen-vl、glm-4v）。"""
+    model = (cfg.get("ai_model") or "").lower()
+    if any(k in model for k in ("deepseek", "deepseek-chat", "deepseek-reasoner")):
+        raise RuntimeError(
+            f"当前模型「{cfg.get('ai_model')}」不支持读图（DeepSeek 是纯文本模型）。\n"
+            "请在「设置」→ AI 设置里把模型名换成支持视觉的，例如：\n"
+            "glm-4v-plus / qwen-vl-plus / gpt-4o（API 地址和 Key 也要用对应服务商的），\n"
+            "保存后重新点「① 生成文字稿件」。")
     content = [{"type": "text",
                 "text": f"课程标题：{title}\n"
                         + (f"配套文字资料：\n{text[:6000]}\n" if text.strip() else "")
                         + "请根据以上图片生成讲解视频分镜稿。"}]
     n = 0
     for p in image_paths:
-        if n >= 4:   # 控制体积
+        if n >= 9:   # 防请求过大（再多 AI 也读不过来，取前 9 张）
             break
         content.append({"type": "image_url",
                         "image_url": {"url": _image_to_data_url(p)}})
@@ -323,11 +377,31 @@ KIND_VALID = ("title", "bullets", "steps", "summary", "twocol", "warn", "fig", "
 def split_narr_mark(scenes):
     """把带标记的 narr 规范化：narr_mark=标记版（配音），narr=干净版（字幕）。"""
     for s in scenes:
+        # 表情符号换成本地文字：中文字体缺 emoji 字形（视频里会变方框），GBK 控制台打印会崩
+        for k in ("narr", "main", "sub", "result", "hw"):
+            if s.get(k):
+                s[k] = _strip_emoji(s[k])
+        if s.get("lines"):
+            s["lines"] = [_strip_emoji(x) for x in s["lines"]]
         nm = s.get("narr_mark") or s.get("narr", "")
         s["narr_mark"] = nm
         s["narr"] = re.sub(r"\*\*|!!|\[停\d+(?:\.\d+)?\]|\[音:[^\]=]+=[^\]]+\]",
                            "", nm).strip()
     return scenes
+
+
+_EMOJI_MAP = {"✅": "【正确】", "❌": "【错误】", "⚠️": "注意：", "⚠": "注意：",
+              "☑": "【对】", "✓": "【对】", "✗": "【错】", "×": "×"}
+
+
+def _strip_emoji(text):
+    if not isinstance(text, str):
+        return text
+    for e, r in _EMOJI_MAP.items():
+        text = text.replace(e, r)
+    # 清掉其余 emoji/装饰符号（含变体选择符），保留常规文字与标点
+    text = re.sub(r"[\U0001F000-\U0001FAFF\u2600-\u26FF\u2700-\u27BF\u2B00-\u2BFF\uFE0F]", "", text)
+    return text
 
 
 def scenes_to_script(title, scenes):
@@ -409,6 +483,12 @@ def parse_script(text):
     # 拆标记：narr=干净版（字幕），narr_mark=标记版（配音）
     for s in scenes:
         s["narr_mark"] = s["narr_mark"].replace("|", "，")
+        # 表情清洗：中文字体缺 emoji 字形 + GBK 控制台打印会崩
+        for k in ("narr_mark", "main", "sub", "result", "hw"):
+            if s.get(k):
+                s[k] = _strip_emoji(s[k])
+        if s.get("lines"):
+            s["lines"] = [_strip_emoji(x) for x in s["lines"]]
         s["narr"] = re.sub(r"\*\*|!!|\[停\d+(?:\.\d+)?\]|\[音:[^\]=]+=[^\]]+\]",
                            "", s["narr_mark"]).strip()
         s.pop("no", None)
@@ -485,7 +565,7 @@ class {scene_cls}(Scene):
         for i, s in enumerate(SCENES, 1):
             assert s.get("kind") in kinds, f"幕{{i}} kind 非法：{{s.get('kind')}}"
             assert str(s.get("narr", "")).strip(), f"幕{{i}} 读白为空"
-        print("✅ 断言通过（分镜结构与读白完整性）")
+        print("[OK] 断言通过（分镜结构与读白完整性）")
 
     def define_elements(self):
         return {{}}
@@ -521,7 +601,7 @@ def build_project(cfg, title, scenes):
     (proj / "script.py").write_text(
         SCRIPT_TMPL.format(title=title, scene_cls=scene_cls), encoding="utf-8")
     # lessonlib 复制到工程目录（script.py 的 sys.path 含工程目录）
-    lib_src = Path(cfg["lessonlib"]) if cfg.get("lessonlib") else (APP_DIR / "lessonlib.py")
+    lib_src = Path(cfg["lessonlib"]) if cfg.get("lessonlib") else (EXE_DIR / "lessonlib.py")
     if not lib_src.exists():
         lib_src = Path(r"D:\视频生成\六年级上册第一单元\lessonlib.py")
     lib_dst = proj / "lessonlib.py"
@@ -685,7 +765,7 @@ def gui_main(cfg):
         tool = Path(cfg["tool_root"])
         ok_tool = (tool / ".venv-tts/Scripts/python.exe").exists() and (tool / ".venv/Scripts/python.exe").exists()
         ok_ref = Path(cfg["ref_wav"]).exists()
-        lib = Path(cfg["lessonlib"]) if cfg.get("lessonlib") else (APP_DIR / "lessonlib.py")
+        lib = Path(cfg["lessonlib"]) if cfg.get("lessonlib") else (EXE_DIR / "lessonlib.py")
         ok_lib = lib.exists()
         ai = "已配置" if cfg.get("ai_key") else "未配置（用本地模板生成稿件）"
         stat.set(f"工具包：{'✓' if ok_tool else '✗ 找不到'}   声线：{'✓' if ok_ref else '✗'}   "
@@ -771,13 +851,42 @@ def gui_main(cfg):
 
     arow = ttk.Frame(tab1); arow.pack(fill="x", pady=4)
 
+    # ---- AI 执行进度指示（进度条 + 计时，证明程序没卡） ----
+    ptime_var = tk.StringVar(value="")
+    pbar = ttk.Progressbar(tab1, mode="indeterminate")
+    def busy_start(msg):
+        """必须在主线程调用（用 ui() 包）。"""
+        state["ai_busy"] = True
+        pbar.pack(fill="x", padx=8, pady=(0, 2))
+        pbar.start(12)
+        t0 = time.time()
+        ptime_var.set(f"{msg}… 已用时 0s")
+        def tick():
+            if not state.get("ai_busy"):
+                return
+            ptime_var.set(f"{msg}… 已用时 {int(time.time() - t0)}s（AI 读图较慢属正常，请勿关闭）")
+            root.after(1000, tick)
+        root.after(1000, tick)
+    def busy_stop():
+        state["ai_busy"] = False
+        try:
+            pbar.stop()
+            pbar.pack_forget()
+        except Exception:
+            pass
+        ptime_var.set("")
+    ttk.Label(tab1, textvariable=ptime_var, foreground="#007acc").pack(anchor="w", padx=8)
+
     def do_gen_draft():
+        sync_cfg_from_entries()
+        refresh_status()
         if state["busy"]:
             return
         if not state["files"]:
             messagebox.showwarning("提示", "请先拖入或添加文件")
             return
         state["busy"] = True
+        ui(lambda m="正在读取文件 / AI 读图出稿": busy_start(m))
         def work():
             try:
                 IMG_EXT = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
@@ -787,6 +896,7 @@ def gui_main(cfg):
                              if p.suffix.lower() in IMG_EXT]
                 title = state["files"][0].stem
                 texts = []
+                scanned = 0
                 for p in text_files:
                     def prog(cur, total, _p=p):
                         if cur % 50 == 0 or cur == total:
@@ -800,14 +910,28 @@ def gui_main(cfg):
                         else f"警告：{p.name} 提不出文字（可能是扫描版/加密 PDF）")
                     if t:
                         texts.append(t)
+                    elif p.suffix.lower() == ".pdf":
+                        # 扫描版 PDF 兜底：渲染前几页转图片走 AI 视觉
+                        pages = pdf_pages_to_images(p, max_pages=4)
+                        if pages and cfg.get("ai_key"):
+                            img_files.extend(pages)
+                            scanned = len(pages)
+                            log(f"扫描版 PDF：已渲染《{p.name}》前 {scanned} 页转图片，交给 AI 读图")
+                        elif not pages:
+                            log(f"《{p.name}》渲染页面失败（缺 pypdfium2 或文件损坏）")
                 full = "\n\n".join(texts).strip()
                 if img_files:
-                    log(f"检测到 {len(img_files)} 张图片")
+                    if scanned:
+                        log(f"检测到 {len(img_files)} 张图片（含扫描页 {scanned} 张）")
+                    else:
+                        log(f"检测到 {len(img_files)} 张图片")
+                    if len(img_files) > 9:
+                        log(f"图片超过 9 张，本次 AI 读图只取前 9 张（防止请求过大失败）")
                     if not cfg.get("ai_key"):
                         raise RuntimeError(
                             "图片生成视频需要 AI 帮你「读图出题」（本地无法 OCR）。\n"
-                            "请在「设置」→ AI 设置里填写 API Key（需支持视觉的模型，\n"
-                            "如 gpt-4o / qwen-vl-plus / glm-4v），保存后重新点「① 生成文字稿件」。")
+                            "请在「设置」→ AI 设置里填写 API Key（如智谱 glm-4.5v，\n"
+                            "或 gpt-4o / qwen-vl-plus），保存后重新点「① 生成文字稿件」。")
                     scenes = gen_scenes_ai_vision(cfg, title, img_files, full)
                     src = "AI 视觉读图"
                 elif full:
@@ -822,8 +946,8 @@ def gui_main(cfg):
                 else:
                     raise RuntimeError(
                         "没有提取到任何内容：可能全部是扫描版/图片型 PDF（整本书是图片）。\n"
-                        "解决办法：① 在「设置」里配 AI Key 走 AI 读图；"
-                        "② 或把书换成可复制文字的 PDF/Word 再拖入。")
+                        "解决办法：在「设置」里配好 AI Key（智谱 glm-4.5v 即可），\n"
+                        "程序会自动把扫描页转成图片交给 AI 读图，然后重新点「① 生成文字稿件」。")
                 state["title"] = title
 
                 def fill_draft():
@@ -839,6 +963,7 @@ def gui_main(cfg):
                 ui(lambda e=e: messagebox.showerror("生成稿件失败", str(e)))
             finally:
                 state["busy"] = False
+                ui(busy_stop)
         threading.Thread(target=work, daemon=True).start()
 
     def get_scenes():
@@ -954,6 +1079,8 @@ def gui_main(cfg):
             vinfo.set("当前逐字稿：格式未通过校验（回「①」页点「校验格式」查看原因）")
 
     def do_video():
+        sync_cfg_from_entries()
+        refresh_status()
         if state["busy"]:
             return
         try:
@@ -1254,6 +1381,7 @@ def gui_main(cfg):
         task = chat_var.get().strip()
         if not task or state.get("task_busy"):
             return
+        sync_cfg_from_entries()
         state["task_busy"] = True
         log(f"任务[{chat_target.get()}]：{task}")
 
@@ -1306,6 +1434,17 @@ def gui_main(cfg):
         v = tk.StringVar(value=str(cfg.get(key, "")))
         ttk.Entry(row, textvariable=v, width=width, show="*" if key == "ai_key" else "").pack(side="left")
         vars_cfg[key] = v
+
+    def sync_cfg_from_entries():
+        """把设置输入框当前值同步进 cfg（生成前自动调用，未点保存也生效）。"""
+        for k, v in vars_cfg.items():
+            val = v.get().strip()
+            if k == "tts_speed":
+                try:
+                    val = float(val)
+                except ValueError:
+                    continue
+            cfg[k] = val
 
     def save_settings():
         for k, v in vars_cfg.items():
@@ -1362,6 +1501,18 @@ def selftest(cfg):
 
 if __name__ == "__main__":
     cfg = load_cfg()
+    if "--check-deps" in sys.argv:
+        # 隐藏参数：验证打包后依赖是否齐全，结果写 deps_check.txt
+        lines = []
+        for m in ("tkinter", "PIL", "pypdfium2", "pypdf", "docx"):
+            try:
+                __import__(m)
+                lines.append(f"{m}: OK")
+            except Exception as e:
+                lines.append(f"{m}: FAIL {e}")
+        (Path(sys.executable).parent / "deps_check.txt").write_text(
+            "\n".join(lines), encoding="utf-8")
+        sys.exit(0)
     if "--selftest" in sys.argv:
         selftest(cfg)
     else:
